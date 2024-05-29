@@ -1,0 +1,598 @@
+import serial
+import struct
+from enum import Enum
+import binascii
+from abc import ABC, abstractmethod
+import time
+import threading
+from threading import RLock
+from queue import Queue
+import csv
+
+
+REQUEST_HEADER_BYTES = 8
+RESPONSE_HEADER_BYTES = 6
+
+BAUD_RATE = 38400
+BYTE_SIZE = 8
+TIME_OUT = 1
+PARITY = "N"
+STOP_BITS = 1
+
+
+class CmdID(Enum):
+    ANSWER = 0x01
+    CONC = 0x03
+    ID = 0x04
+    ENG_DATA = 0x09
+    TEMP = 0x21
+    PRES = 0x22
+    REL_HUM = 0x23
+    ABS_HUM = 0x24
+    STATUS = 0x41
+    VERSION = 0x42
+    SENSOR_INFO = 0x43
+    MEAS = 0x61
+    SHUT_DOWN = 0x62
+
+
+class GasID(Enum):
+    NO_GAS = 0
+    HYDROGEN = 1
+    HYDROGEN_MIXTURE = 2
+    METHANE = 3
+    LIGHT_GAS = 4
+    MEDIUM_GAS = 5
+    HEAVY_GAS = 6
+    UNKNOWN_GAS = 253
+    UNDER_RANGE = 254  # less than -5% of LEL
+    OVER_RANGE = 255  # greater than 100% of LEL
+
+
+class Meas(Enum):
+    PERCENT_LEL = 0x0
+    PERCENT_VOL = 0x1
+    MPS_CONT = 0x2
+    MPS_STOP = 0x3
+
+
+class Status(Enum):
+    OK = 0x00
+    CRC_FAILED = 0x01
+    BAD_PARAM = 0x02
+    EXE_FAILED = 0x03
+    NO_MEM = 0x04
+    UNKNOWN_CMD = 0x05
+    INCOMPLETE_COMMAND = 0x07
+    HW_ERR_AO = 0x20
+    HW_ERR_VDD = 0x21
+    HW_ERR_VREF = 0x22
+    HW_ENV_XCD_RANGE = 0x23
+    HW_ENV_SNSR_MALFUNCTION = 0x24
+    HW_ERR_MCU_FLASH = 0x25
+    HW_SENSOR_INITIALIZATION = 0x26
+    HW_SENSOR_NEGATIVE = 0x30
+    HW_CONDENSE_COND = 0x31
+    HW_SENSOR_MALFUNCTION = 0x32
+
+
+request_length = {CmdID.ANSWER: 0,
+                  CmdID.CONC: 0,
+                  CmdID.ID: 0,
+                  CmdID.ENG_DATA: 0,
+                  CmdID.TEMP: 0,
+                  CmdID.PRES: 0,
+                  CmdID.REL_HUM: 0,
+                  CmdID.ABS_HUM: 0,
+                  CmdID.STATUS: 0,
+                  CmdID.VERSION: 0,
+                  CmdID.SENSOR_INFO: 0,
+                  CmdID.MEAS: 1,
+                  CmdID.SHUT_DOWN: 0}
+
+request_packing = {CmdID.ANSWER: '<4H',
+                   CmdID.CONC: '<4H',
+                   CmdID.ID: '<4H',
+                   CmdID.ENG_DATA: '<4H',
+                   CmdID.TEMP: '<4H',
+                   CmdID.PRES: '<4H',
+                   CmdID.REL_HUM: '<4H',
+                   CmdID.ABS_HUM: '<4H',
+                   CmdID.STATUS: '<4H',
+                   CmdID.VERSION: '<4H',
+                   CmdID.SENSOR_INFO: '<4H',
+                   CmdID.MEAS: '<4HB',
+                   CmdID.SHUT_DOWN: '<4H'}
+
+response_length = {CmdID.ANSWER: 28,
+                   CmdID.CONC: 4,
+                   CmdID.ID: 4,
+                   CmdID.ENG_DATA: 128,
+                   CmdID.TEMP: 4,
+                   CmdID.PRES: 4,
+                   CmdID.REL_HUM: 4,
+                   CmdID.ABS_HUM: 4,
+                   CmdID.STATUS: 1,
+                   CmdID.VERSION: 8,
+                   CmdID.SENSOR_INFO: 68,
+                   CmdID.MEAS: 0,
+                   CmdID.SHUT_DOWN: 0}
+
+response_packing = {CmdID.ANSWER: '<2B2HLfL4f',
+                    CmdID.CONC: '<2B2Hf',
+                    CmdID.ID: '<2B2HL',
+                    CmdID.ENG_DATA: '<2B2HI',
+                    CmdID.TEMP: '<2B2Hf',
+                    CmdID.PRES: '<2B2Hf',
+                    CmdID.REL_HUM: '<2B2Hf',
+                    CmdID.ABS_HUM: '<2B2Hf',
+                    CmdID.STATUS: '<2B2HB',
+                    CmdID.VERSION: '<2B2H8B',
+                    CmdID.SENSOR_INFO: '<2B2H32cI16c16c',
+                    CmdID.MEAS: '<2B2H',
+                    CmdID.SHUT_DOWN: 0}
+
+response_fields = {CmdID.ANSWER: ['CYCLE_COUNT', 'CONC', 'ID', 'TEMP', 'PRESSURE', 'REL_HUM', 'ABS_HUM'],
+                   CmdID.CONC: ['CONC'],
+                   CmdID.ID: ['ID'],
+                   CmdID.ENG_DATA: ['LENGTH', 'DATA'],
+                   CmdID.TEMP: ['TEMP'],
+                   CmdID.PRES: ['PRESSURE'],
+                   CmdID.REL_HUM: ['REL_HUM'],
+                   CmdID.ABS_HUM: ['ABS_HUM'],
+                   CmdID.STATUS: ['STATUS'],
+                   CmdID.VERSION: ['SW_VERSION', 'HW_VERSION', 'PROTOCOL_VERSION'],
+                   CmdID.SENSOR_INFO: ['SERIAL_NUM', 'SENSOR_TYPE', 'CAL_DATE', 'MFG_DATE'],
+                   CmdID.MEAS: [],
+                   CmdID.SHUT_DOWN: []}
+
+
+class CMDBase(ABC):
+    checksum_blank = 0x0000
+    reserved = 0x0000
+
+    def __init__(self, cmdID):
+        self.cmdID = cmdID
+        self.request_length = request_length[cmdID]
+        self.request_packing = request_packing[cmdID]
+
+        self.response_length = response_length[cmdID]
+        self.response_packing = response_packing[cmdID]
+        self.response_fields = response_fields[cmdID]
+
+    @abstractmethod
+    def command(self):
+        checksum = binascii.crc_hqx(struct.pack(self.request_packing,
+                                                self.cmdID.value,
+                                                self.request_length,
+                                                MEAS.reserved,
+                                                MEAS.checksum_blank), 0xFFFF)
+        command = struct.pack(self.request_packing,
+                              self.cmdID.value,
+                              self.request_length,
+                              MEAS.reserved,
+                              checksum)
+        return command
+
+    @abstractmethod
+    def response(self, response):
+        if self.is_valid_response(response):
+            if self.is_status_ok(response):
+                # return the data or the status if command doesnt return data
+                response = list(struct.unpack(self.response_packing, response))
+                response_header = response[:2]
+                response_data = response[4:]
+                header = dict(zip(['CmdID', 'Status'], [CmdID(response_header[0]).name, Status(response_header[1]).name]))
+                data = dict(zip(self.response_fields, response_data))
+                response_dict = {**header, **data}
+                return response_dict
+            else:  # case where there is no data to return , but maybe status is not ok
+                response = list(struct.unpack(self.response_packing, response))
+                response_dict = dict(zip(['CmdID', 'Status'], [CmdID(response[0]).name, Status(response[1]).name]))
+                return response_dict
+        else:  # invalid checksum-assume bad message, throw it away? add some error handling relative to serial library?
+            return {}
+
+    def is_valid_response(self, response):
+        # print(response)
+        cmdID_echo = int.from_bytes(response[0:1], 'little')
+        checksum = struct.unpack('<H', response[4:6])[0]
+        response = bytearray(response)
+        response[4:6] = b'\x00\x00'
+        computed_checksum = binascii.crc_hqx(response, 0xFFFF)
+
+        if (cmdID_echo == self.cmdID.value) and (computed_checksum == checksum):
+            return True
+        else:
+            return False
+
+    def is_status_ok(self, response):
+        status = int.from_bytes(response[1:2], 'little')
+        if status == 0:
+            return True
+        else:
+            return False
+
+
+class ANSWER(CMDBase):
+    def __init__(self):
+        super(ANSWER, self).__init__(CmdID.ANSWER)
+
+    def command(self):
+        return super(ANSWER, self).command()
+
+    def response(self, response):
+        if self.is_valid_response(response):
+            if self.is_status_ok(response):
+                response = list(struct.unpack(self.response_packing, response))
+                response_header = response[:2]
+                response_data = response[4:]
+                response_data[2] = GasID(response_data[2]).name
+                header = dict(
+                    zip(['CmdID', 'Status'], [CmdID(response_header[0]).name, Status(response_header[1]).name]))
+                data = dict(zip(self.response_fields, response_data))
+                response_dict = {**header, **data}
+                return response_dict
+            else:
+                response = list(struct.unpack(self.response_packing, response))
+                response_dict = dict(zip(['CmdID', 'Status'], [CmdID(response[0]).name, Status(response[1]).name]))
+                return response_dict
+        else:
+            return {}
+
+
+class CONC(CMDBase):
+    def __init__(self):
+        super(CONC, self).__init__(CmdID.CONC)
+
+    def command(self):
+        return super(CONC, self).command()
+
+    def response(self, response):
+        return super(CONC, self).response(response)
+
+
+class ID(CMDBase):
+    def __init__(self):
+        super(ID, self).__init__(CmdID.ID)
+
+    def command(self):
+        return super(ID, self).command()
+
+    def response(self, response):
+        if self.is_valid_response(response):
+            if self.is_status_ok(response):
+                response = list(struct.unpack(self.response_packing, response))
+                response_header = response[:2]
+                response_data = response[4:]
+                response_data[0] = GasID(response_data[0]).name
+                header = dict(
+                    zip(['CmdID', 'Status'], [CmdID(response_header[0]).name, Status(response_header[1]).name]))
+                data = dict(zip(self.response_fields, response_data))
+                response_dict = {**header, **data}
+                return response_dict
+            else:
+                response = list(struct.unpack(self.response_packing, response))
+                response_dict = dict(zip(['CmdID', 'Status'], [CmdID(response[0]).name, Status(response[1]).name]))
+                return response_dict
+        else:
+            return {}
+
+
+class ENG_DATA(CMDBase):
+    def __init__(self):
+        super(ENG_DATA, self).__init__(CmdID.ENG_DATA)
+
+    def command(self):
+        return super(ENG_DATA, self).command()
+
+    def response(self, response):
+        if self.is_valid_response(response):
+            if self.is_status_ok(response):
+                length = list(struct.unpack(self.response_packing, response[0:10]))[4]
+                response_packing = self.response_packing + '{}c'.format(length)
+
+                response = struct.unpack(response_packing, response)
+                response_header = response[:2]
+                length_data = response[4]
+                eng_data = response[5:]
+                header = dict(zip(['CmdID', 'Status'], [CmdID(response_header[0]).name, Status(response_header[1]).name]))
+                data = dict(zip(self.response_fields, [length_data, eng_data]))
+                response_dict = {**header, **data}
+                return response_dict
+            else:
+                response = list(struct.unpack(self.response_packing, response))
+                response_dict = dict(zip(['CmdID', 'Status'], [CmdID(response[0]).name, Status(response[1]).name]))
+                return response_dict
+        else:
+            return {}
+
+
+class TEMP(CMDBase):
+    def __init__(self):
+        super(TEMP, self).__init__(CmdID.TEMP)
+
+    def command(self):
+        return super(TEMP, self).command()
+
+    def response(self, response):
+        return super(TEMP, self).response(response)
+
+
+class PRES(CMDBase):
+    def __init__(self):
+        super(PRES, self).__init__(CmdID.PRES)
+
+    def command(self):
+        return super(PRES, self).command()
+
+    def response(self, response):
+        return super(PRES, self).response(response)
+
+
+class REL_HUM(CMDBase):
+    def __init__(self):
+        super(REL_HUM, self).__init__(CmdID.REL_HUM)
+
+    def command(self):
+        return super(REL_HUM, self).command()
+
+    def response(self, response):
+        return super(REL_HUM, self).response(response)
+
+
+class ABS_HUM(CMDBase):
+    def __init__(self):
+        super(ABS_HUM, self).__init__(CmdID.ABS_HUM)
+
+    def command(self):
+        return super(ABS_HUM, self).command()
+
+    def response(self, response):
+        return super(ABS_HUM, self).response(response)
+
+
+class STATUS(CMDBase):
+    def __init__(self):
+        super(STATUS, self).__init__(CmdID.STATUS)
+
+    def command(self):
+        return super(STATUS, self).command()
+
+    def response(self, response):
+        if self.is_valid_response(response):
+            if self.is_status_ok(response):
+                response = list(struct.unpack(self.response_packing, response))
+                response_header = response[:2]
+                response_data = response[4:]
+                response_data[0] = Status(response_data[0]).name
+                header = dict(
+                    zip(['CmdID', 'Status'], [CmdID(response_header[0]).name, Status(response_header[1]).name]))
+                data = dict(zip(self.response_fields, response_data))
+                response_dict = {**header, **data}
+                return response_dict
+            else:
+                response = list(struct.unpack(self.response_packing, response))
+                response_dict = dict(zip(['CmdID', 'Status'], [CmdID(response[0]).name, Status(response[1]).name]))
+                return response_dict
+        else:
+            return {}
+
+
+class VERSION(CMDBase):
+    def __init__(self):
+        super(VERSION, self).__init__(CmdID.VERSION)
+
+    def command(self):
+        return super(VERSION, self).command()
+
+    def response(self, response):
+        if self.is_valid_response(response):
+            if self.is_status_ok(response):
+                response = struct.unpack(self.response_packing, response)
+                response_header = response[:2]
+                sw_version = "{}.{}.{}.{}".format(*response[4:8])
+                hw_version = "{}.{}".format(*response[8:10])
+                protocol_version = "{}.{}".format(*response[10:12])
+                header = dict(
+                    zip(['CmdID', 'Status'], [CmdID(response_header[0]).name, Status(response_header[1]).name]))
+                data = dict(zip(self.response_fields, [sw_version, hw_version, protocol_version]))
+                response_dict = {**header, **data}
+                return response_dict
+            else:
+                response = list(struct.unpack(self.response_packing, response))
+                response_dict = dict(zip(['CmdID', 'Status'], [CmdID(response[0]).name, Status(response[1]).name]))
+                return response_dict
+        else:
+            return {}
+
+
+class SENSOR_INFO(CMDBase):
+    def __init__(self):
+        super(SENSOR_INFO, self).__init__(CmdID.SENSOR_INFO)
+
+    def command(self):
+        return super(SENSOR_INFO, self).command()
+
+    def response(self, response):
+        if self.is_valid_response(response):
+            if self.is_status_ok(response):
+                response_header = struct.unpack('<2B2H', response[0:6])
+                serial_num = response[6:38].decode('utf-8').replace('\x00', '')
+                sensor_type = struct.unpack('<I', response[38:42])[0]
+                cal_date = response[42:58].decode('utf-8').replace('\x00', '')
+                mfg_date = response[58:74].decode('utf-8').replace('\x00', '')
+
+                header = dict(zip(['CmdID', 'Status'], [CmdID(response_header[0]).name, Status(response_header[1]).name]))
+                data = dict(zip(self.response_fields, [serial_num, sensor_type, cal_date, mfg_date]))
+                response_dict = {**header, **data}
+                return response_dict
+            else:
+                response = list(struct.unpack(self.response_packing, response))
+                response_dict = dict(zip(['CmdID', 'Status'], [CmdID(response[0]).name, Status(response[1]).name]))
+                return response_dict
+        else:
+            return {}
+
+
+class MEAS(CMDBase):
+    def __init__(self, conc_unit=Meas.PERCENT_VOL, mode=Meas.MPS_CONT):
+        super().__init__(CmdID.MEAS)
+        self.payload = (conc_unit.value << 4) + mode.value
+
+    def command(self):
+        checksum = binascii.crc_hqx(struct.pack(self.request_packing,
+                                                self.cmdID.value,
+                                                self.request_length,
+                                                MEAS.reserved,
+                                                MEAS.checksum_blank,
+                                                self.payload), 0xFFFF)
+        command = struct.pack(self.request_packing,
+                              self.cmdID.value,
+                              self.request_length,
+                              MEAS.reserved,
+                              checksum,
+                              self.payload)
+        return command
+
+    def response(self, response):
+        # won't get any response from MEAS command
+        return {}
+
+
+class SHUT_DOWN(CMDBase):
+    def __init__(self):
+        super(SHUT_DOWN, self).__init__(CmdID.SHUT_DOWN)
+
+    def command(self):
+        return super(SHUT_DOWN, self).command()
+
+    def response(self, response):
+        # won't get any response from SHUT_DOWN command
+        return {}
+
+
+class NanoMPS:
+    # so error checking and serial stuff and locks would go in here (query method)? and get passed back up to the other reader class?
+    def __init__(self, port):
+        try:
+            self.serial = serial.Serial(port=port,
+                                        baudrate=BAUD_RATE,
+                                        bytesize=BYTE_SIZE,
+                                        timeout=TIME_OUT,
+                                        parity=PARITY,
+                                        stopbits=STOP_BITS)
+
+        except serial.serialutil.SerialException:
+            self.serial.close()
+            self.serial.open()
+        self.shutting_down = False
+        self.cycle_count = 0  # Store the previous read count
+        self.version = {'CmdID': 'VERSION', 'Status': 'OK', 'SW_VERSION': '4.1.0.1', 'HW_VERSION': '1.0', 'PROTOCOL_VERSION': '2.0'}  # store the version info for comparison/com port checking
+        self.data = {}
+        self.command_queue = Queue()
+        self.command_event = None
+        self.port_monitor_thread = threading.Thread(target=self.port_monitor, name="nano_port_monitor", daemon=True)
+        self.lock = RLock()
+
+    def port_monitor(self):
+        while not self.shutting_down:
+            if not self.command_queue.empty():
+                cmd, evt = self.command_queue.get()
+                self.serial.write(cmd.command())
+                response = cmd.response(self.serial.read(RESPONSE_HEADER_BYTES + cmd.response_length))
+                if response:
+                    #print("command received: {}".format(cmd.cmdID.name))
+                    #print("response: {}".format(response))  # bool or dict depending on command
+                    if cmd is ANSWER:  # need to add handlers for other commands - e.g. version check, etc.
+                        self.cycle_count = response['CYCLE_COUNT']
+                    with self.lock:
+                        self.data = response  # is data good? set data to response
+                evt.set()
+                self.command_queue.task_done()
+            time.sleep(0.1)
+
+    def send_command(self, cmd):
+        self.command_event = threading.Event()  # initialize the event with the is set False
+        self.command_queue.put((cmd, self.command_event))  # put on the command queue
+        self.command_event.wait()  # wait for the command to be handled before you send another one
+        # Not sure how this plays with where the command is trying to come from
+        # Presumably this would block the main thread until event is set maybe should only put like .wait(0.5) s ?
+
+    def get_data(self):
+        with self.lock:
+            return self.data
+
+    def read_data(self):
+        self.send_command(ANSWER())
+
+    def start_up(self):
+        self.port_monitor_thread.start()
+        self.send_command(MEAS())
+
+    def shut_down(self):
+        self.send_command(MEAS(mode=Meas.MPS_STOP))
+        self.send_command(SHUT_DOWN())  # not sure what this does or if power will need to be cycled after this call
+        self.serial.close()
+        self.shutting_down = True
+        with self.lock:
+            self.data = {}
+        print("*** nano was shut_down() ***")
+
+
+
+def main():
+    # class CommandRequestHeader???
+    # class CommandRequest: # ??? Should this be a class or a function only meas has parameters for this
+    # cmdID  # 16 bits/2 bytes little endian </ unsigned short int in struct "H"
+    # length  # 16 bits/2 bytes little endian </ unsigned short int in struct "H"
+    # reserved = 0x0000  # always this as not yet implemented by nevada nano, but needs to be there
+    # checksum  # 16 bits/2 bytes little endian </ unsigned short int in struct "H"
+    # payload  # varies by command
+
+    # class CommandReply:
+    # cmdID  # 8 bits 1 byte "B" in struct
+    # status  # 8 bits 1 byte "B" in struct
+    # length  # 16 bits/2 bytes little endian </ unsigned short int in struct "H"
+    # checksum  # 16 bits/2 bytes little endian </ unsigned short int in struct "H"
+    # payload  # varies by command
+
+    # Tx packet status - add additional values if desired
+
+    
+    nano = NanoMPS('/dev/ttyUSB0')
+    nano.start_up()
+    #print("??")
+    #print(nano.send_command(VERSION()))
+    #print("??")
+    mdata=[]
+    CmdID.ANSWER
+    #nano.send_command(MEAS())
+    #with open("methanedata.csv","a",newline="") as f:
+       #writer = csv.writer(f)
+    while True:
+        try:
+            #print("??")
+            #data = query("CmdID.ANSWER", ser)
+            #print("CmdID.ANSWER")
+            #print(nano.port_monitor())
+            nano.send_command(ANSWER())
+            time.sleep(1)
+            #print(nano.get_data())
+            #nano.shut_down()
+            nano.get_data()
+            with open("methanedata.csv","w",newline="") as f:
+                writer = csv.writer(f)
+                mdata.append((nano.data['TEMP'],nano.data['CONC'],nano.data['ID'], nano.data['REL_HUM'], nano.data['ABS_HUM'] ))
+                writer.writerows(mdata)
+            
+            print(nano.data)     
+            print(nano.read_data())
+    
+        except KeyboardInterrupt:
+            #print("??")
+            nano.shut_down()
+            break
+                                                                                                                                                                                                                                                                                               
+if __name__ == '__main__':
+    main() 
